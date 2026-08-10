@@ -1,0 +1,71 @@
+# ============================================================
+#  Secrets / credentials  — NEVER commit these
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# ============================================================
+#  Downloaded / generated business data
+# ============================================================
+downloads/
+*.csv
+*.xlsx
+*.xls
+flow_Log.txt
+*_Log.txt
+*.log
+
+# ============================================================
+#  Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ============================================================
+#  Selenium / WebDriver
+# ============================================================
+chromedriver*
+geckodriver*
+.wdm/
+
+# ============================================================
+#  Editors / OS
+# ============================================================
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# ============================================================
+#  Claude Code local settings
+# ============================================================
+.claude/settings.local.json
