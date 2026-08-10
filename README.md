@@ -1,6 +1,4 @@
-# For dbo.ACS => PPS,ACS,WISDOM
-
-# ACS — Nike CBD Data Automation
+# ACS — Nike CBD Data Automation (For dbo.ACS => PPS,ACS,WISDOM)
 
 Automates the process of logging into the **Nike ACS (Apparel Cost Sheet)** portal, fetching CBD (Cost Breakdown Detail) search results, cleaning the data, and loading it into a target destination via an SSIS package.
 
