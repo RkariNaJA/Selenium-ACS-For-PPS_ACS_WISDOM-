@@ -1,4 +1,4 @@
-# ACS — Nike CBD Data Automation (For dbo.ACS => PPS,ACS,WISDOM)
+# ACS — Nike CBD Data Automation(For ACS,PPS,WISDOM)
 
 Automates the process of logging into the **Nike ACS (Apparel Cost Sheet)** portal, fetching CBD (Cost Breakdown Detail) search results, cleaning the data, and loading it into a target destination via an SSIS package.
 
@@ -21,14 +21,8 @@ So we need to (a) bypass the broken Export button by calling the data API direct
 ACS/
 ├── FlowACS.py        # Orchestrator — runs the full pipeline in sequence
 ├── FetchData.py      # Selenium + API automation to fetch ALL CBD records (season-split)
+├── DownloadCSV.py    # Alternative approach: downloads CSV page-by-page via UI
 ├── CleanFile.py      # Cleans downloaded CSV and triggers SSIS package
-├── Version/          # Superseded versions kept for reference
-│   ├── DownloadCSV-old.py   # Original UI Export-CSV approach (first 500 only)
-│   ├── FerchDataV1.py       # Single broad API fetch (hit the 2000 cap)
-│   └── FerchDataV2.py       # Season-split, before dimension sub-splitting
-├── test/             # Diagnostic scripts used to prove the caps
-│   ├── Check_count-test.py    # Compares broad vs per-season counts
-│   └── Total_Record-test.py   # Tests which second field splits a capped season
 └── downloads/        # Auto-created; stores daily download folders (YYYY-MM-DD/)
 ```
 
@@ -42,23 +36,38 @@ Once we have the token, we can call the site's internal data API directly instea
 
 ---
 
-## 📌📌 Getting past the 2000 cap (season splitting(Season + Dimension)) 📌 📌
+## 📌📌 Getting past the 2000 cap (Two-Pass: Season → Dimension) 📌📌
 
-Think of it this way: you still only want papers from three specific folders (the statuses). But those three folders together hold 7,000 papers and the **machine only gives you 2,000 at a time.**
-So you don't stop filtering by folder — you additionally say **"give me the three folders, but only for Spring 2027,"** then **"only Fall 2026,"** etc. Every grab is still restricted to your three statuses; **you're just also slicing by season so each grab is small enough to come back whole**. Right now the largest Season + Dimension = 917 record
+Think of it this way: you still only want papers from three specific folders (the statuses). But those three folders together hold 7,000+ papers and the **machine only gives you 2,000 at a time.**
+So you don't stop filtering by folder — you additionally say **"give me the three folders, but only for Spring 2027,"** then **"only Fall 2026,"** etc. Every grab is still restricted to your three statuses; **you're just also slicing by season so each grab is small enough to come back whole.** Right now the largest Season + Dimension slice ≈ **917 records**.
 
-The "drawers" are **seasons**. The logic:
+The status filter (`Q-QRMDS`, `Q-CRMDS`, `C`) is **always applied** — every request in both passes includes it. We beat the cap by _tightening_ the search (adding season, then dimension), never by loosening the status filter.
 
-1. **Get the full season list** from the `GetAllSeasonInformation` reference endpoint, then keep only **season 25 and newer** (SP25, SU25, FA25, HO25, and up) — older seasons are ignored.
-2. **Go season by season.** For each season, ask how many records it has:
-   - **Under 2000** → fetch the whole season (paging 400 at a time).
-   - **Exactly 2000** → the season is itself being capped, so it can't be trusted whole. Split it further (step 3).
-3. **Split capped seasons by dimension.** A "dimension" is a category like BASKETBALL LICENSED, WOMENS, KNIT, etc. One season is too big, but season + dimension is small (largest observed ≈ 917). So a capped season is fetched dimension by dimension.
-4. **Safety alarm.** If any season + dimension combo _still_ hits 2000, the script prints a loud warning instead of silently losing data — a signal that an even finer split is needed.
-5. **De-duplicate by `cbdid`.** Because overlapping searches can return the same record twice, every record's unique ID is tracked so each is written only once.
-6. **Save one clean CSV** with just the required columns.
+**First**, get the drawer list: fetch all seasons from the `GetAllSeasonInformation` reference endpoint and keep only **season 25 and newer** (SP25, SU25, FA25, HO25, and up) — older seasons are ignored.
 
-**Trade-off:** because the data is now fetched season by season (and sometimes dimension by dimension) instead of one big grab, the script makes many more requests. A full run takes a few minutes instead of a few seconds — the price of getting _all_ the data instead of just the first 2000.
+Then the work happens in two passes, matching the console output:
+
+### 🟦 Pass 1 — Fetch by season ⚠️
+
+Go season by season. For each kept season, run the search (still filtered by the 3 statuses) and page through it 400 at a time:
+
+- **Under 2000** → the season came back whole. Keep all its records.
+- **Exactly 2000 (capped)** → the season itself is too big to trust whole. Keep the first 2000 anyway (dedup makes this safe), and mark the season for Pass 2.
+
+While doing this, Pass 1 also **harvests every dimension value** it sees (BASKETBALL LICENSED, WOMENS, KNIT, etc.) to build the list used in Pass 2.
+
+### 🟩 Pass 2 — Split the capped seasons by dimension ⚠️
+
+For each season flagged as capped in Pass 1, re-run the search once **per dimension** (status + season + dimension). Each of these slices is small enough to return complete (largest ≈ 917), so together they recover the records the capped season was hiding.
+
+- **Safety alarm:** if any season + dimension combo _still_ hits 2000, the script prints a loud `STILL CAPPED` warning (console + log file) instead of silently losing data — the signal that an even finer split (e.g. factory code) is needed.
+
+### 🔁 Throughout both passes
+
+- **De-duplicate by `cbdid`.** Because Pass 1 (capped seasons' first 2000) and Pass 2 (per-dimension slices) overlap, every record's unique ID is tracked so each is written only once.
+- **One clean CSV** is saved at the end with just the required columns, plus a timestamped **run-log** summarizing each season's count and each dimension breakdown.
+
+**Trade-off:** because the data is now fetched season by season (and dimension by dimension for large seasons) instead of one big grab, the script makes many more requests. A full run takes a few minutes instead of a few seconds — the price of getting _all_ the data instead of just the first 2000.
 
 ---
 
@@ -69,7 +78,7 @@ FlowACS.py
     └─▶ FetchData.py   →  Login to Nike ACS  →  Set filters (CBD Status)
                         →  Trigger search  →  Capture Bearer token
                         →  Get season list (keep season 25+)
-                        →  Fetch each season; split capped seasons by dimension(WOMENS, BASKETBALL LICENSED)
+                        →  Fetch each season; split capped seasons by dimension
                         →  De-dupe by cbdid  →  Write CBD_AllRecords.csv
     └─▶ CleanFile.py   →  Read & clean CSV  →  Save sorted Excel (archived + target)
                         →  Run SSIS package to load into database
@@ -95,7 +104,7 @@ FlowACS.py
 - Copies a fixed-name file to the ACS target folder: `CBD_SearchResults_cleaned.xlsx`
 - Executes the configured SSIS package via `DTExec.exe`
 
-### `Version/DownloadCSV-old.py` _(Alternative)_
+### `DownloadCSV.py` _(Alternative)_
 
 - An earlier approach that downloads CSV page-by-page through the UI (Export CSV button)
 - Limited to the first 500 records; kept only as a fallback reference
