@@ -1,3 +1,4 @@
+# Download CSV from Export CSV button For 500 Record
 from selenium.webdriver.chrome import remote_connection
 import time
 import glob

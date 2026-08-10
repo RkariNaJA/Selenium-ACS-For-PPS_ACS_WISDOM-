@@ -4,26 +4,63 @@ Automates the process of logging into the **Nike ACS (Apparel Cost Sheet)** port
 
 ---
 
+## The Problem
+
+The ACS search interface has two hard limits stacked on top of each other:
+
+1. **The "Export CSV" button only ever exports the first 500 records** of a result set, no matter which page you're viewing. Clicking through pages and exporting each one just re-downloads the same first 500.
+2. **The underlying data API caps any single search at 2000 records.** Even going straight to the API, one search returns at most 2000 rows — the rest are silently dropped. In reality there are far more than 2000 records (7,000+ across current seasons).
+
+So we need to (a) bypass the broken Export button by calling the data API directly, and (b) break each search into smaller slices that each stay under the 2000 cap, then glue all the slices back together into one complete file.
+
+---
+
 ## 📁 Project Structure
 
 ```
 ACS/
 ├── FlowACS.py        # Orchestrator — runs the full pipeline in sequence
-├── FetchData.py      # Selenium + API automation to fetch all CBD records
-├── DownloadCSV.py    # Alternative approach: downloads CSV page-by-page via UI
+├── FetchData.py      # Selenium + API automation to fetch ALL CBD records (season-split)
 ├── CleanFile.py      # Cleans downloaded CSV and triggers SSIS package
+├── Version/          # Superseded versions kept for reference
+│   ├── DownloadCSV-old.py   # Original UI Export-CSV approach (first 500 only)
+│   ├── FerchDataV1.py       # Single broad API fetch (hit the 2000 cap)
+│   └── FerchDataV2.py       # Season-split, before dimension sub-splitting
+├── test/             # Diagnostic scripts used to prove the caps
+│   ├── Check_count-test.py    # Compares broad vs per-season counts
+│   └── Total_Record-test.py   # Tests which second field splits a capped season
 └── downloads/        # Auto-created; stores daily download folders (YYYY-MM-DD/)
 ```
 
 ---
 
-## 2k Record LOGIC(Bypass the Export CSV button)
+## Bypassing the Export button (the token trick)
 
-**\_capture_token** — grabs the login token. The website's data endpoint requires an Authorization: **Bearer token to answer requests**. Rather than you copying that secret by hand, this function watches Chrome's network log, finds the request the app itself already made to the data endpoint, and reads the token off it. It keeps checking the log for up to 30 seconds until it finds it, then returns it.
+**\_capture_token** — grabs the login token. The website's data endpoint requires an `Authorization: Bearer` token to answer requests. Rather than copying that secret by hand, this function watches Chrome's network log, **finds the request the app itself already made to the data endpoint, and reads the token off it**. It keeps checking the log for up to 30 seconds until it finds it, then returns it. No proxy or extra tools needed.
 
-**fetch_all_records** — uses that token to pull everything. It calls \_capture_token to get the token, **then repeatedly asks the data endpoint for records one page at a time (400 per page)**. From the first response it learns the total count (2000) and calculates how many pages that is (5). It loops through all pages, piling up the records, then hands the full set to \_write_csv to save as one clean CSV.
+Once we have the token, we can call the site's internal data API directly instead of fighting the Export CSV button.
 
-The big picture: instead of fighting the broken "Export CSV" button that only ever gave you the first 500, you go straight to the data source the website uses internally — borrow its token, ask for every page, and build your own complete file of all 2000 records.
+---
+
+## 📌📌 Getting past the 2000 cap (season splitting(Season + Dimension)) 📌 📌
+
+Think of it this way: you still only want papers from three specific folders (the statuses). But those three folders together hold 7,000 papers and the **machine only gives you 2,000 at a time.**
+So you don't stop filtering by folder — you additionally say **"give me the three folders, but only for Spring 2027,"** then **"only Fall 2026,"** etc. Every grab is still restricted to your three statuses; **you're just also slicing by season so each grab is small enough to come back whole**. Right now the largest Season + Dimension = 917 record
+
+The "drawers" are **seasons**. The logic:
+
+1. **Get the full season list** from the `GetAllSeasonInformation` reference endpoint, then keep only **season 25 and newer** (SP25, SU25, FA25, HO25, and up) — older seasons are ignored.
+2. **Go season by season.** For each season, ask how many records it has:
+   - **Under 2000** → fetch the whole season (paging 400 at a time).
+   - **Exactly 2000** → the season is itself being capped, so it can't be trusted whole. Split it further (step 3).
+3. **Split capped seasons by dimension.** A "dimension" is a category like BASKETBALL LICENSED, WOMENS, KNIT, etc. One season is too big, but season + dimension is small (largest observed ≈ 917). So a capped season is fetched dimension by dimension.
+4. **Safety alarm.** If any season + dimension combo _still_ hits 2000, the script prints a loud warning instead of silently losing data — a signal that an even finer split is needed.
+5. **De-duplicate by `cbdid`.** Because overlapping searches can return the same record twice, every record's unique ID is tracked so each is written only once.
+6. **Save one clean CSV** with just the required columns.
+
+**Trade-off:** because the data is now fetched season by season (and sometimes dimension by dimension) instead of one big grab, the script makes many more requests. A full run takes a few minutes instead of a few seconds — the price of getting _all_ the data instead of just the first 2000.
+
+---
 
 ## ⚙️ How It Works
 
@@ -31,7 +68,9 @@ The big picture: instead of fighting the broken "Export CSV" button that only ev
 FlowACS.py
     └─▶ FetchData.py   →  Login to Nike ACS  →  Set filters (CBD Status)
                         →  Trigger search  →  Capture Bearer token
-                        →  Fetch all pages via API  →  Write CBD_AllRecords.csv
+                        →  Get season list (keep season 25+)
+                        →  Fetch each season; split capped seasons by dimension(WOMENS, BASKETBALL LICENSED)
+                        →  De-dupe by cbdid  →  Write CBD_AllRecords.csv
     └─▶ CleanFile.py   →  Read & clean CSV  →  Save sorted Excel (archived + target)
                         →  Run SSIS package to load into database
 ```
@@ -42,8 +81,11 @@ FlowACS.py
 - Opens "Search Criteria" and selects CBD statuses: **Q-QRMDS**, **Q-CRMDS**, **C**
 - Clicks the CBD search button to trigger a real network request
 - Captures the **Bearer token** from Chrome's performance logs (no proxy needed)
-- Calls `GetPagedSearchCBD` API directly (400 records/page) until all records are collected
-- Writes output to `downloads/YYYY-MM-DD/CBD_AllRecords.csv`
+- Pulls the season list from `GetAllSeasonInformation` and keeps **season 25 and newer**
+- For each kept season, calls `GetPagedSearchCBD` (400 records/page):
+  - fetches the season whole if it's under the 2000 cap
+  - splits it by **dimension** if it hits the cap
+- De-duplicates records by `cbdid` and writes `downloads/YYYY-MM-DD/CBD_AllRecords.csv`
 
 ### Step 2 — `CleanFile.py`
 
@@ -53,10 +95,10 @@ FlowACS.py
 - Copies a fixed-name file to the ACS target folder: `CBD_SearchResults_cleaned.xlsx`
 - Executes the configured SSIS package via `DTExec.exe`
 
-### `DownloadCSV.py` _(Alternative)_
+### `Version/DownloadCSV-old.py` _(Alternative)_
 
 - An earlier approach that downloads CSV page-by-page through the UI (Export CSV button)
-- Useful as a fallback if the API token capture approach fails
+- Limited to the first 500 records; kept only as a fallback reference
 
 ### `FlowACS.py` _(Orchestrator)_
 
@@ -164,5 +206,8 @@ python CleanFile.py
 
 - Downloads are organized by date under `downloads/YYYY-MM-DD/`
 - The Bearer token is captured automatically from Chrome's performance log — no extra proxy or network tool needed
+- The 2000-record cap is worked around by fetching season by season (and dimension by dimension for large seasons); records are de-duplicated by `cbdid`
+- A full run makes many API calls and takes a few minutes — this is expected
+- Watch the console for any "STILL CAPPED" warning: it means a season + dimension combo exceeded 2000 and needs a finer split
 - If the SSIS path is not configured, `CleanFile.py` will skip the SSIS step without failing
 - `DTExec.exe` is searched in common SQL Server 140/150 installation paths automatically
